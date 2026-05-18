@@ -16,6 +16,54 @@ struct FileNode: Identifiable, Hashable {
     var children: [FileNode]?
 }
 
+struct MarkdownHeading: Identifiable, Hashable {
+    let id: String
+    let title: String
+    let level: Int
+}
+
+@MainActor
+final class DocumentOpenStore: ObservableObject {
+    static let shared = DocumentOpenStore()
+
+    @Published var url: URL?
+
+    private init() {}
+
+    func open(_ url: URL) {
+        self.url = url
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        NSWindow.allowsAutomaticWindowTabbing = false
+        UserDefaults.standard.set(false, forKey: "NSQuitAlwaysKeepsWindows")
+    }
+
+    func applicationSupportsSecureRestorableState(_ app: NSApplication) -> Bool {
+        false
+    }
+
+    func application(_ application: NSApplication, open urls: [URL]) {
+        guard let url = urls.first else { return }
+        Task { @MainActor in
+            DocumentOpenStore.shared.open(url)
+        }
+    }
+
+    func applicationShouldOpenUntitledFile(_ sender: NSApplication) -> Bool {
+        false
+    }
+
+    func application(_ sender: NSApplication, openFile filename: String) -> Bool {
+        Task { @MainActor in
+            DocumentOpenStore.shared.open(URL(fileURLWithPath: filename))
+        }
+        return true
+    }
+}
+
 @MainActor
 final class WorkspaceModel: ObservableObject {
     @Published var rootURL: URL?
@@ -27,9 +75,10 @@ final class WorkspaceModel: ObservableObject {
 
     private var saveTask: Task<Void, Never>?
     private var isLoading = false
+    private let lastOpenedFileKey = "lastOpenedFilePath"
 
     init() {
-        loadSampleWorkspace()
+        loadLastOpenedFile()
     }
 
     func openFolder() {
@@ -42,14 +91,47 @@ final class WorkspaceModel: ObservableObject {
 
         guard panel.runModal() == .OK, let url = panel.url else { return }
         rootURL = url
-        tree = scan(url)
-        if let first = firstFile(in: tree) {
-            select(first)
-        } else {
-            selectedFile = nil
-            text = "# Empty Workspace\n\nNo Markdown files were found in this folder.\n"
-            status = "No Markdown files"
+        loadFolder(url)
+    }
+
+    func openFile() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = false
+        panel.canChooseFiles = true
+        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [
+            UTType(filenameExtension: "md") ?? .plainText,
+            UTType(filenameExtension: "markdown") ?? .plainText
+        ]
+        panel.prompt = "Open"
+        panel.message = "Choose a Markdown file."
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        open(url)
+    }
+
+    func open(_ url: URL) {
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDirectory) else {
+            status = "File not found"
+            return
         }
+
+        if isDirectory.boolValue {
+            rootURL = url
+            loadFolder(url)
+            return
+        }
+
+        guard ["md", "markdown"].contains(url.pathExtension.lowercased()) else {
+            status = "Unsupported file"
+            return
+        }
+
+        let folder = url.deletingLastPathComponent()
+        rootURL = folder
+        tree = scan(folder)
+        select(MarkdownFile(id: url, url: url))
     }
 
     func newNote() {
@@ -72,6 +154,7 @@ final class WorkspaceModel: ObservableObject {
         text = (try? String(contentsOf: file.url, encoding: .utf8)) ?? ""
         wordCount = Self.countWords(text)
         status = "Ready"
+        UserDefaults.standard.set(file.url.path, forKey: lastOpenedFileKey)
         isLoading = false
     }
 
@@ -85,6 +168,17 @@ final class WorkspaceModel: ObservableObject {
     func refreshTree() {
         if let rootURL {
             tree = scan(rootURL)
+        }
+    }
+
+    private func loadFolder(_ url: URL) {
+        tree = scan(url)
+        if let first = firstFile(in: tree) {
+            select(first)
+        } else {
+            selectedFile = nil
+            text = "# Empty Workspace\n\nNo Markdown files were found in this folder.\n"
+            status = "No Markdown files"
         }
     }
 
@@ -113,41 +207,26 @@ final class WorkspaceModel: ObservableObject {
         }
     }
 
-    private func loadSampleWorkspace() {
-        let sample = MarkdownFile(
-            id: URL(fileURLWithPath: "/Samples/welcome.md"),
-            url: URL(fileURLWithPath: "/Samples/welcome.md")
-        )
-        selectedFile = sample
-        text = """
-        # Welcome to MarkLens
+    private func loadLastOpenedFile() {
+        guard let path = UserDefaults.standard.string(forKey: lastOpenedFileKey), !path.isEmpty else {
+            selectedFile = nil
+            text = ""
+            wordCount = 0
+            status = "Open a Markdown file"
+            return
+        }
 
-        MarkLens is a native macOS Markdown editor. It keeps writing and preview in one surface, so the document stays readable while you edit.
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            UserDefaults.standard.removeObject(forKey: lastOpenedFileKey)
+            selectedFile = nil
+            text = ""
+            wordCount = 0
+            status = "Last file not found"
+            return
+        }
 
-        ## Native by design
-
-        - SwiftUI window and sidebar
-        - AppKit TextKit editor for fast text handling
-        - Debounced local file saves
-        - No local web server
-
-        > Open a folder, select a Markdown file, and keep writing.
-
-        ```swift
-        let app = "MarkLens"
-        print("\\(app) renders as you type")
-        ```
-        """
-        wordCount = Self.countWords(text)
-        tree = [
-            FileNode(
-                id: URL(fileURLWithPath: "/Samples"),
-                url: URL(fileURLWithPath: "/Samples"),
-                name: "Samples",
-                file: nil,
-                children: [FileNode(id: sample.id, url: sample.url, name: sample.name, file: sample, children: nil)]
-            )
-        ]
+        open(url)
     }
 
     private func scan(_ root: URL) -> [FileNode] {
@@ -215,10 +294,55 @@ final class WorkspaceModel: ObservableObject {
     private static func countWords(_ value: String) -> Int {
         value.split { $0.isWhitespace || $0.isNewline }.count
     }
+
+    static func headings(in markdown: String) -> [MarkdownHeading] {
+        var headings: [MarkdownHeading] = []
+        var counts: [String: Int] = [:]
+
+        for line in markdown.components(separatedBy: .newlines) {
+            guard let match = line.range(of: #"^(#{1,6})\s+(.+)$"#, options: .regularExpression) else { continue }
+            let value = String(line[match])
+            let level = value.prefix { $0 == "#" }.count
+            let title = value.drop { $0 == "#" || $0 == " " }.trimmingCharacters(in: .whitespaces)
+            guard !title.isEmpty else { continue }
+
+            let slug = slugify(title)
+            let count = counts[slug, default: 0]
+            counts[slug] = count + 1
+            let uniqueSlug = count == 0 ? slug : "\(slug)-\(count)"
+            headings.append(MarkdownHeading(id: uniqueSlug, title: title, level: level))
+        }
+
+        return headings
+    }
+
+    private static func slugify(_ value: String) -> String {
+        let lowered = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var result = ""
+        var previousWasSeparator = false
+
+        for scalar in lowered.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) || scalar.value >= 0x4E00 && scalar.value <= 0x9FFF || scalar == UnicodeScalar("_") || scalar == UnicodeScalar("-") {
+                result.unicodeScalars.append(scalar)
+                previousWasSeparator = false
+            } else if CharacterSet.whitespacesAndNewlines.contains(scalar), !previousWasSeparator, !result.isEmpty {
+                result.append("-")
+                previousWasSeparator = true
+            }
+        }
+
+        return result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
 }
 
 struct MarkLensAppView: View {
     @StateObject private var model = WorkspaceModel()
+    @ObservedObject private var documentOpenStore = DocumentOpenStore.shared
+    @State private var selectedHeadingID: String?
+
+    private var headings: [MarkdownHeading] {
+        WorkspaceModel.headings(in: model.text)
+    }
 
     var body: some View {
         NavigationSplitView {
@@ -227,104 +351,66 @@ struct MarkLensAppView: View {
         } detail: {
             VStack(spacing: 0) {
                 topbar
-                MarkdownTextView(text: $model.text, onChange: model.textChanged)
+                MarkdownTextView(text: $model.text, scrollTarget: selectedHeadingID, onChange: model.textChanged)
+                    .id(model.selectedFile?.id)
                     .background(Color(nsColor: .textBackgroundColor))
             }
         }
+        .navigationTitle(model.selectedFile?.name ?? "Untitled")
         .frame(minWidth: 980, minHeight: 680)
         .onReceive(NotificationCenter.default.publisher(for: .markLensNewNoteCommand)) { _ in
             model.newNote()
         }
-        .toolbar {
-            ToolbarItemGroup {
-                Button(action: model.openFolder) {
-                    Label("Open Folder", systemImage: "folder")
-                }
-                Button(action: model.newNote) {
-                    Label("New Note", systemImage: "square.and.pencil")
-                }
-                Button(action: model.refreshTree) {
-                    Label("Refresh", systemImage: "arrow.clockwise")
-                }
+        .onReceive(NotificationCenter.default.publisher(for: .markLensOpenFileCommand)) { _ in
+            model.openFile()
+        }
+        .onAppear {
+            if let url = documentOpenStore.url {
+                model.open(url)
             }
-            ToolbarItemGroup {
-                formatButton("H1", command: .heading1)
-                formatButton("H2", command: .heading2)
-                formatButton("B", command: .bold)
-                formatButton("I", command: .italic)
-                formatButton("Code", command: .code)
-                formatButton("Quote", command: .quote)
-                formatButton("List", command: .list)
-                formatButton("Task", command: .task)
-            }
+        }
+        .onReceive(documentOpenStore.$url.compactMap { $0 }) { url in
+            model.open(url)
+        }
+        .onOpenURL { url in
+            model.open(url)
         }
     }
 
     private var sidebar: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack(spacing: 10) {
-                Image(nsImage: NSApp.applicationIconImage)
-                    .resizable()
-                    .frame(width: 34, height: 34)
-                    .cornerRadius(8)
-                VStack(alignment: .leading, spacing: 0) {
-                    Text("MarkLens").font(.headline)
-                    Text(model.rootURL?.lastPathComponent ?? "Native Markdown")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+        List(headings, selection: $selectedHeadingID) { heading in
+            Button {
+                selectedHeadingID = heading.id
+            } label: {
+                Text(heading.title)
+                    .font(heading.level <= 2 ? .subheadline.weight(.semibold) : .subheadline)
+                    .lineLimit(2)
+                    .padding(.leading, CGFloat(max(heading.level - 1, 0)) * 12)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.horizontal, 12)
-            .padding(.top, 8)
-
-            List(selection: Binding(get: { model.selectedFile?.id }, set: { _ in })) {
-                OutlineGroup(model.tree, children: \.children) { node in
-                    if let file = node.file {
-                        Button {
-                            model.select(file)
-                        } label: {
-                            Label(file.name, systemImage: "doc.text")
-                                .frame(maxWidth: .infinity, alignment: .leading)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(model.selectedFile?.id == file.id ? .primary : .secondary)
-                    } else {
-                        Label(node.name, systemImage: "folder")
-                            .font(.subheadline.weight(.semibold))
-                    }
-                }
+            .buttonStyle(.plain)
+            .foregroundStyle(selectedHeadingID == heading.id ? .primary : .secondary)
+        }
+        .overlay {
+            if headings.isEmpty {
+                Text("No headings")
+                    .foregroundStyle(.secondary)
             }
         }
     }
 
     private var topbar: some View {
         HStack {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(model.selectedFile?.url.deletingLastPathComponent().path(percentEncoded: false) ?? "Sample workspace")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .lineLimit(1)
-                Text(model.selectedFile?.name ?? "Untitled")
-                    .font(.title3.weight(.semibold))
-                    .lineLimit(1)
-            }
+            Text(model.selectedFile?.name ?? "Untitled")
+                .font(.title3.weight(.semibold))
+                .lineLimit(1)
             Spacer()
-            Text(model.status)
-                .foregroundStyle(.secondary)
-            Text("\(model.wordCount) words")
-                .foregroundStyle(.secondary)
         }
         .padding(.horizontal, 20)
-        .frame(height: 58)
+        .frame(height: 54)
         .background(.bar)
         .overlay(alignment: .bottom) {
             Divider()
-        }
-    }
-
-    private func formatButton(_ title: String, command: EditorCommand) -> some View {
-        Button(title) {
-            NotificationCenter.default.post(name: .markLensFormatCommand, object: command)
         }
     }
 }
@@ -336,10 +422,13 @@ enum EditorCommand {
 extension Notification.Name {
     static let markLensFormatCommand = Notification.Name("MarkLensFormatCommand")
     static let markLensNewNoteCommand = Notification.Name("MarkLensNewNoteCommand")
+    static let markLensOpenFileCommand = Notification.Name("MarkLensOpenFileCommand")
 }
 
 struct MarkdownTextView: NSViewRepresentable {
     @Binding var text: String
+    var horizontalInset: CGFloat = 72
+    var scrollTarget: String?
     let onChange: (String) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -352,8 +441,11 @@ struct MarkdownTextView: NSViewRepresentable {
         scrollView.drawsBackground = true
         scrollView.backgroundColor = NSColor.textBackgroundColor
 
-        let textView = NSTextView()
+        let textView = StableMarkdownTextView()
         textView.isRichText = false
+        textView.importsGraphics = false
+        textView.usesFontPanel = false
+        textView.usesRuler = false
         textView.isAutomaticQuoteSubstitutionEnabled = false
         textView.isAutomaticDashSubstitutionEnabled = false
         textView.isAutomaticTextReplacementEnabled = false
@@ -364,7 +456,7 @@ struct MarkdownTextView: NSViewRepresentable {
         textView.isVerticallyResizable = true
         textView.isHorizontallyResizable = false
         textView.textContainer?.widthTracksTextView = true
-        textView.textContainerInset = NSSize(width: 72, height: 54)
+        textView.textContainerInset = NSSize(width: horizontalInset, height: 40)
         textView.font = NSFont.systemFont(ofSize: 17)
         textView.string = text
         context.coordinator.textView = textView
@@ -380,13 +472,17 @@ struct MarkdownTextView: NSViewRepresentable {
             textView.string = text
             context.coordinator.applyHighlighting()
         }
+        context.coordinator.scroll(to: scrollTarget)
     }
 
     final class Coordinator: NSObject, NSTextViewDelegate {
         var parent: MarkdownTextView
         weak var textView: NSTextView?
         private var observer: NSObjectProtocol?
+        private var isApplyingHighlight = false
         private var highlightTask: Task<Void, Never>?
+        private var lastActiveLine = NSRange(location: NSNotFound, length: 0)
+        private var lastScrollTarget: String?
         private let highlighter = MarkdownHighlighter()
 
         init(_ parent: MarkdownTextView) {
@@ -404,27 +500,99 @@ struct MarkdownTextView: NSViewRepresentable {
 
         deinit {
             if let observer { NotificationCenter.default.removeObserver(observer) }
+            highlightTask?.cancel()
         }
 
         func textDidChange(_ notification: Notification) {
             guard let textView else { return }
+            guard !isApplyingHighlight else { return }
             parent.onChange(textView.string)
             scheduleHighlighting()
         }
 
-        func applyHighlighting() {
+        func textViewDidChangeSelection(_ notification: Notification) {
+            guard !isApplyingHighlight else { return }
+            guard let textView else { return }
+            let activeLine = currentLineRange(in: textView)
+            guard !NSEqualRanges(activeLine, lastActiveLine) else { return }
+            applyHighlighting(preservingViewport: true)
+        }
+
+        func applyHighlighting(preservingViewport: Bool = false) {
             guard let textView, let storage = textView.textStorage else { return }
+            guard !isApplyingHighlight else { return }
+            let updates = {
+                self.isApplyingHighlight = true
+                let selection = textView.selectedRanges
+                let activeLine = self.currentLineRange(in: textView)
+                self.lastActiveLine = activeLine
+                self.highlighter.apply(to: storage, activeLine: activeLine)
+                textView.selectedRanges = selection
+                textView.typingAttributes = [
+                    .font: NSFont.systemFont(ofSize: 17),
+                    .foregroundColor: NSColor.labelColor,
+                    .backgroundColor: NSColor.textBackgroundColor
+                ]
+                self.isApplyingHighlight = false
+            }
+
+            if preservingViewport, let stableTextView = textView as? StableMarkdownTextView {
+                stableTextView.preserveViewportDuring(updates)
+                return
+            }
+
+            isApplyingHighlight = true
             let selection = textView.selectedRanges
-            highlighter.apply(to: storage)
+            let activeLine = currentLineRange(in: textView)
+            lastActiveLine = activeLine
+            highlighter.apply(to: storage, activeLine: activeLine)
             textView.selectedRanges = selection
+            textView.typingAttributes = [
+                .font: NSFont.systemFont(ofSize: 17),
+                .foregroundColor: NSColor.labelColor,
+                .backgroundColor: NSColor.textBackgroundColor
+            ]
+            isApplyingHighlight = false
         }
 
         private func scheduleHighlighting() {
             highlightTask?.cancel()
             highlightTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(for: .milliseconds(60))
+                try? await Task.sleep(for: .milliseconds(35))
                 guard !Task.isCancelled else { return }
                 self?.applyHighlighting()
+            }
+        }
+
+        private func currentLineRange(in textView: NSTextView) -> NSRange {
+            let nsText = textView.string as NSString
+            guard nsText.length > 0 else { return NSRange(location: 0, length: 0) }
+            let selection = textView.selectedRange()
+            let location = min(selection.location, max(nsText.length - 1, 0))
+            return nsText.lineRange(for: NSRange(location: location, length: 0))
+        }
+
+        func scroll(to target: String?) {
+            guard let target, target != lastScrollTarget, let textView else { return }
+            lastScrollTarget = target
+
+            let nsText = textView.string as NSString
+            let full = NSRange(location: 0, length: nsText.length)
+            var counts: [String: Int] = [:]
+
+            nsText.enumerateSubstrings(in: full, options: [.byLines, .substringNotRequired]) { _, range, _, stop in
+                let line = nsText.substring(with: range)
+                guard let heading = MarkdownHighlighter.heading(in: line) else { return }
+                let slug = MarkdownHighlighter.slugify(heading.title)
+                let count = counts[slug, default: 0]
+                counts[slug] = count + 1
+                let uniqueSlug = count == 0 ? slug : "\(slug)-\(count)"
+                if uniqueSlug == target {
+                    textView.scrollRangeToVisible(range)
+                    textView.setSelectedRange(NSRange(location: range.location, length: 0))
+                    textView.window?.makeFirstResponder(textView)
+                    stop.pointee = true
+                }
             }
         }
 
@@ -479,11 +647,185 @@ struct MarkdownTextView: NSViewRepresentable {
     }
 }
 
+final class StableMarkdownTextView: NSTextView {
+    private var protectedVisibleOrigin: NSPoint?
+    private var protectionDepth = 0
+
+    override func mouseDown(with event: NSEvent) {
+        beginViewportProtection()
+        super.mouseDown(with: event)
+        restoreProtectedVisibleOrigin(clearProtection: false)
+        DispatchQueue.main.async { [weak self] in
+            self?.restoreProtectedVisibleOrigin(clearProtection: true)
+        }
+    }
+
+    override func scrollRangeToVisible(_ range: NSRange) {
+        guard protectedVisibleOrigin == nil else { return }
+        super.scrollRangeToVisible(range)
+    }
+
+    func preserveViewportDuring(_ updates: () -> Void) {
+        beginViewportProtection()
+        updates()
+        restoreProtectedVisibleOrigin(clearProtection: false)
+        DispatchQueue.main.async { [weak self] in
+            self?.restoreProtectedVisibleOrigin(clearProtection: true)
+        }
+    }
+
+    private func beginViewportProtection() {
+        protectionDepth += 1
+        if protectedVisibleOrigin == nil {
+            protectedVisibleOrigin = enclosingScrollView?.contentView.bounds.origin
+        }
+    }
+
+    private func restoreProtectedVisibleOrigin(clearProtection: Bool) {
+        guard let origin = protectedVisibleOrigin, let scrollView = enclosingScrollView else { return }
+        if let textContainer {
+            layoutManager?.ensureLayout(for: textContainer)
+        }
+        let clipView = scrollView.contentView
+        let maxY = max(bounds.height - clipView.bounds.height, 0)
+        let restoredOrigin = NSPoint(
+            x: origin.x,
+            y: min(max(origin.y, 0), maxY)
+        )
+        clipView.setBoundsOrigin(restoredOrigin)
+        scrollView.reflectScrolledClipView(clipView)
+        if clearProtection {
+            protectionDepth = max(protectionDepth - 1, 0)
+            if protectionDepth == 0 {
+                protectedVisibleOrigin = nil
+            }
+        }
+    }
+
+    private func tableLineRecords(in text: NSString, fullRange: NSRange) -> [RenderedTableRow] {
+        var records: [RenderedTableRow] = []
+        text.enumerateSubstrings(in: fullRange, options: [.byLines, .substringNotRequired]) { _, range, _, _ in
+            records.append(RenderedTableRow(line: text.substring(with: range), range: range))
+        }
+        return records
+    }
+
+    private func renderedTableBlocks(in lines: [RenderedTableRow]) -> [RenderedTableBlock] {
+        var blocks: [RenderedTableBlock] = []
+        var index = 0
+
+        while index + 1 < lines.count {
+            guard isRenderedTableRow(lines[index].line),
+                  isRenderedTableSeparator(lines[index + 1].line),
+                  renderedTableCells(lines[index].line).count == renderedTableCells(lines[index + 1].line).count else {
+                index += 1
+                continue
+            }
+
+            var rows = [lines[index], lines[index + 1]]
+            index += 2
+            while index < lines.count, isRenderedTableRow(lines[index].line) {
+                rows.append(lines[index])
+                index += 1
+            }
+            blocks.append(RenderedTableBlock(rows: rows))
+        }
+
+        return blocks
+    }
+}
+
+private struct RenderedTableRow {
+    let line: String
+    let range: NSRange
+}
+
+private struct RenderedTableBlock {
+    let rows: [RenderedTableRow]
+}
+
+private func isRenderedTableRow(_ line: String) -> Bool {
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    guard trimmed.contains("|") else { return false }
+    return renderedTableCells(trimmed).count >= 2
+}
+
+private func isRenderedTableSeparator(_ line: String) -> Bool {
+    let cells = renderedTableCells(line)
+    guard cells.count >= 2 else { return false }
+    return cells.allSatisfy { cell in
+        cell.range(of: #"^:?-{3,}:?$"#, options: .regularExpression) != nil
+    }
+}
+
+private func renderedTableCells(_ line: String) -> [String] {
+    var trimmed = line.trimmingCharacters(in: .whitespaces)
+    if trimmed.hasPrefix("|") {
+        trimmed.removeFirst()
+    }
+    if trimmed.hasSuffix("|") {
+        trimmed.removeLast()
+    }
+
+    return trimmed
+        .split(separator: "|", omittingEmptySubsequences: false)
+        .map { $0.trimmingCharacters(in: .whitespaces) }
+}
+
+private func pipeOffsets(in line: String) -> [Int] {
+    let nsLine = line as NSString
+    var offsets: [Int] = []
+    var searchRange = NSRange(location: 0, length: nsLine.length)
+
+    while searchRange.length > 0 {
+        let found = nsLine.range(of: "|", options: [], range: searchRange)
+        guard found.location != NSNotFound else { break }
+        offsets.append(found.location)
+        let nextLocation = found.upperBound
+        searchRange = NSRange(location: nextLocation, length: nsLine.length - nextLocation)
+    }
+
+    return offsets
+}
+
 final class MarkdownHighlighter {
     private let baseFont = NSFont.systemFont(ofSize: 17)
     private let monoFont = NSFont.monospacedSystemFont(ofSize: 15, weight: .regular)
+    private let syntaxColor = NSColor.secondaryLabelColor
 
-    func apply(to storage: NSTextStorage) {
+    private enum TableLineRole {
+        case header
+        case separator
+        case body
+    }
+
+    static func heading(in line: String) -> (level: Int, title: String)? {
+        guard let match = line.range(of: #"^(#{1,6})\s+(.+)$"#, options: .regularExpression) else { return nil }
+        let value = String(line[match])
+        let level = value.prefix { $0 == "#" }.count
+        let title = value.drop { $0 == "#" || $0 == " " }.trimmingCharacters(in: .whitespaces)
+        return title.isEmpty ? nil : (level, title)
+    }
+
+    static func slugify(_ value: String) -> String {
+        let lowered = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        var result = ""
+        var previousWasSeparator = false
+
+        for scalar in lowered.unicodeScalars {
+            if CharacterSet.alphanumerics.contains(scalar) || scalar.value >= 0x4E00 && scalar.value <= 0x9FFF || scalar == UnicodeScalar("_") || scalar == UnicodeScalar("-") {
+                result.unicodeScalars.append(scalar)
+                previousWasSeparator = false
+            } else if CharacterSet.whitespacesAndNewlines.contains(scalar), !previousWasSeparator, !result.isEmpty {
+                result.append("-")
+                previousWasSeparator = true
+            }
+        }
+
+        return result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
+    }
+
+    func apply(to storage: NSTextStorage, activeLine: NSRange?) {
         let full = NSRange(location: 0, length: storage.length)
         storage.beginEditing()
         storage.setAttributes([
@@ -494,62 +836,324 @@ final class MarkdownHighlighter {
         ], range: full)
 
         let text = storage.string as NSString
-        text.enumerateSubstrings(in: full, options: [.byLines, .substringNotRequired]) { _, range, _, _ in
-            guard range.length > 0 else { return }
-            let line = text.substring(with: range)
-            self.styleLine(line, range: range, storage: storage)
+        let lines = lineRecords(in: text, fullRange: full)
+        let tableRoles = tableLineRoles(in: lines)
+        let tableRanges = mergedRanges(for: tableRoles.keys.map { lines[$0].range })
+        var inCodeBlock = false
+        var codeBlockRanges: [NSRange] = []
+        var codeBlockStart: Int?
+        for (index, record) in lines.enumerated() {
+            guard record.range.length > 0 else { continue }
+            self.styleLine(
+                record.line,
+                range: record.range,
+                storage: storage,
+                inCodeBlock: inCodeBlock,
+                tableRole: inCodeBlock ? nil : tableRoles[index],
+                isActive: self.intersects(record.range, activeLine)
+            )
+            if self.isCodeFence(record.line) {
+                if let start = codeBlockStart {
+                    codeBlockRanges.append(NSRange(location: start, length: record.range.upperBound - start))
+                    codeBlockStart = nil
+                } else {
+                    codeBlockStart = record.range.location
+                }
+                inCodeBlock.toggle()
+            }
+        }
+        if let start = codeBlockStart {
+            codeBlockRanges.append(NSRange(location: start, length: storage.length - start))
         }
 
-        styleInline(pattern: "`([^`]+)`", storage: storage, attributes: [
-            .font: monoFont,
-            .foregroundColor: NSColor.controlAccentColor,
-            .backgroundColor: NSColor.controlBackgroundColor
-        ])
-        styleInline(pattern: "\\*\\*([^*]+)\\*\\*", storage: storage, attributes: [
-            .font: NSFont.boldSystemFont(ofSize: 17)
-        ])
+        styleInlineMarkdown(storage, activeLine: activeLine, excludedRanges: codeBlockRanges + tableRanges)
         storage.endEditing()
     }
 
-    private func styleLine(_ line: String, range: NSRange, storage: NSTextStorage) {
-        if line.hasPrefix("# ") {
-            storage.addAttributes([.font: NSFont.boldSystemFont(ofSize: 34)], range: range)
-            storage.addAttributes([.foregroundColor: NSColor.secondaryLabelColor], range: NSRange(location: range.location, length: 1))
-        } else if line.hasPrefix("## ") {
-            storage.addAttributes([.font: NSFont.boldSystemFont(ofSize: 26)], range: range)
-            storage.addAttributes([.foregroundColor: NSColor.secondaryLabelColor], range: NSRange(location: range.location, length: 2))
-        } else if line.hasPrefix("### ") {
-            storage.addAttributes([.font: NSFont.boldSystemFont(ofSize: 21)], range: range)
-            storage.addAttributes([.foregroundColor: NSColor.secondaryLabelColor], range: NSRange(location: range.location, length: 3))
+    private func styleLine(_ line: String, range: NSRange, storage: NSTextStorage, inCodeBlock: Bool, tableRole: TableLineRole?, isActive: Bool) {
+        if inCodeBlock || isCodeFence(line) {
+            let fence = isCodeFence(line)
+            storage.addAttributes([
+                .font: monoFont,
+                .foregroundColor: fence ? (isActive ? syntaxColor : NSColor.tertiaryLabelColor) : NSColor.labelColor,
+                .backgroundColor: NSColor.controlBackgroundColor,
+                .paragraphStyle: paragraphStyle(firstLineHeadIndent: 18, headIndent: 18, paragraphSpacing: 4)
+            ], range: range)
+            if fence, !isActive {
+                hideSyntax(in: range, storage: storage)
+            }
+            return
+        }
+
+        if let tableRole {
+            styleTableLine(line, range: range, storage: storage, role: tableRole)
+            return
+        }
+
+        if let heading = Self.heading(in: line) {
+            let fontSize: CGFloat
+            switch heading.level {
+            case 1: fontSize = 34
+            case 2: fontSize = 27
+            case 3: fontSize = 22
+            default: fontSize = 18
+            }
+            let markerLength = min(heading.level + 1, range.length)
+            let markerRange = NSRange(location: range.location, length: markerLength)
+            let titleRange = NSRange(location: range.location + markerLength, length: max(range.length - markerLength, 0))
+            storage.addAttributes([
+                .font: NSFont.boldSystemFont(ofSize: fontSize),
+                .foregroundColor: NSColor.labelColor,
+                .paragraphStyle: paragraphStyle(paragraphSpacing: heading.level <= 2 ? 18 : 12)
+            ], range: range)
+            if isActive {
+                storage.addAttributes([
+                    .font: NSFont.boldSystemFont(ofSize: max(fontSize - 6, 13)),
+                    .foregroundColor: syntaxColor
+                ], range: markerRange)
+            } else {
+                hideSyntax(in: markerRange, storage: storage)
+            }
+            storage.addAttributes([.font: NSFont.boldSystemFont(ofSize: fontSize)], range: titleRange)
         } else if line.hasPrefix("> ") {
             let style = paragraphStyle(firstLineHeadIndent: 18, headIndent: 18)
             storage.addAttributes([
                 .paragraphStyle: style,
-                .foregroundColor: NSColor.secondaryLabelColor
+                .foregroundColor: syntaxColor
             ], range: range)
-        } else if line.hasPrefix("```") {
+            let markerRange = NSRange(location: range.location, length: min(2, range.length))
+            if isActive {
+                storage.addAttributes([.foregroundColor: NSColor.tertiaryLabelColor], range: markerRange)
+            } else {
+                hideSyntax(in: markerRange, storage: storage)
+            }
+        } else if line.trimmingCharacters(in: .whitespaces) == "---" {
             storage.addAttributes([
-                .font: monoFont,
-                .foregroundColor: NSColor.secondaryLabelColor
+                .foregroundColor: NSColor.separatorColor,
+                .paragraphStyle: paragraphStyle(paragraphSpacing: 18)
             ], range: range)
         } else if line.hasPrefix("- ") || line.hasPrefix("* ") || line.range(of: #"^\d+\. "#, options: .regularExpression) != nil {
             storage.addAttributes([.paragraphStyle: paragraphStyle(firstLineHeadIndent: 0, headIndent: 22)], range: range)
+            let markerLength = listMarkerLength(line)
+            let markerRange = NSRange(location: range.location, length: min(markerLength, range.length))
+            if isActive {
+                storage.addAttributes([.foregroundColor: syntaxColor], range: markerRange)
+            } else {
+                storage.addAttributes([.foregroundColor: NSColor.tertiaryLabelColor], range: markerRange)
+            }
         }
     }
 
-    private func styleInline(pattern: String, storage: NSTextStorage, attributes: [NSAttributedString.Key: Any]) {
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
+    private func styleTableLine(_ line: String, range: NSRange, storage: NSTextStorage, role: TableLineRole) {
+        let foreground: NSColor
+        let background: NSColor
+        let font: NSFont
+
+        switch role {
+        case .header:
+            foreground = NSColor.labelColor
+            background = NSColor.controlBackgroundColor
+            font = NSFont.monospacedSystemFont(ofSize: 15, weight: .semibold)
+        case .separator:
+            foreground = NSColor.tertiaryLabelColor
+            background = NSColor.controlBackgroundColor
+            font = monoFont
+        case .body:
+            foreground = NSColor.labelColor
+            background = NSColor.textBackgroundColor
+            font = monoFont
+        }
+
+        storage.addAttributes([
+            .font: font,
+            .foregroundColor: foreground,
+            .backgroundColor: background,
+            .paragraphStyle: paragraphStyle(firstLineHeadIndent: 18, headIndent: 18, paragraphSpacing: 2)
+        ], range: range)
+
+        if role == .separator {
+            return
+        }
+
+        for pipeRange in pipeRanges(in: line, lineRange: range) {
+            storage.addAttributes([.foregroundColor: syntaxColor], range: pipeRange)
+        }
+    }
+
+    private func styleInlineMarkdown(_ storage: NSTextStorage, activeLine: NSRange?, excludedRanges: [NSRange]) {
         let full = NSRange(location: 0, length: storage.length)
-        regex.enumerateMatches(in: storage.string, range: full) { match, _, _ in
-            guard let match else { return }
-            storage.addAttributes(attributes, range: match.range)
+
+        applyRegex(#"`([^`]+)`"#, storage: storage, range: full) { match in
+            guard !self.intersectsAny(match.range, excludedRanges) else { return }
+            let isActive = self.intersects(match.range, activeLine)
+            if isActive {
+                storage.addAttributes([.foregroundColor: self.syntaxColor], range: match.range)
+            } else {
+                self.hideSyntax(in: NSRange(location: match.range.location, length: 1), storage: storage)
+                self.hideSyntax(in: NSRange(location: match.range.upperBound - 1, length: 1), storage: storage)
+            }
+            storage.addAttributes([
+                .font: self.monoFont,
+                .foregroundColor: NSColor.controlAccentColor,
+                .backgroundColor: NSColor.controlBackgroundColor
+            ], range: match.range(at: 1))
+        }
+
+        applyRegex(#"\*\*([^*]+)\*\*"#, storage: storage, range: full) { match in
+            guard !self.intersectsAny(match.range, excludedRanges) else { return }
+            let isActive = self.intersects(match.range, activeLine)
+            if isActive {
+                storage.addAttributes([.foregroundColor: self.syntaxColor], range: match.range)
+            } else {
+                self.hideSyntax(in: NSRange(location: match.range.location, length: 2), storage: storage)
+                self.hideSyntax(in: NSRange(location: match.range.upperBound - 2, length: 2), storage: storage)
+            }
+            storage.addAttributes([.font: NSFont.boldSystemFont(ofSize: 17), .foregroundColor: NSColor.labelColor], range: match.range(at: 1))
+        }
+
+        applyRegex(#"(?<!\*)\*([^*]+)\*(?!\*)"#, storage: storage, range: full) { match in
+            guard !self.intersectsAny(match.range, excludedRanges) else { return }
+            let italic = NSFontManager.shared.convert(self.baseFont, toHaveTrait: .italicFontMask)
+            let isActive = self.intersects(match.range, activeLine)
+            if isActive {
+                storage.addAttributes([.foregroundColor: self.syntaxColor], range: match.range)
+            } else {
+                self.hideSyntax(in: NSRange(location: match.range.location, length: 1), storage: storage)
+                self.hideSyntax(in: NSRange(location: match.range.upperBound - 1, length: 1), storage: storage)
+            }
+            storage.addAttributes([.font: italic, .foregroundColor: NSColor.labelColor], range: match.range(at: 1))
+        }
+
+        applyRegex(#"\[([^\]]+)\]\(([^)]+)\)"#, storage: storage, range: full) { match in
+            guard !self.intersectsAny(match.range, excludedRanges) else { return }
+            let isActive = self.intersects(match.range, activeLine)
+            if isActive {
+                storage.addAttributes([.foregroundColor: self.syntaxColor], range: match.range)
+            } else {
+                self.hideSyntax(in: NSRange(location: match.range.location, length: 1), storage: storage)
+                let closeLabel = NSRange(location: match.range(at: 1).upperBound, length: 2)
+                let closeLink = NSRange(location: match.range.upperBound - 1, length: 1)
+                self.hideSyntax(in: closeLabel, storage: storage)
+                self.hideSyntax(in: match.range(at: 2), storage: storage)
+                self.hideSyntax(in: closeLink, storage: storage)
+            }
+            storage.addAttributes([
+                .foregroundColor: NSColor.controlAccentColor,
+                .underlineStyle: NSUnderlineStyle.single.rawValue
+            ], range: match.range(at: 1))
         }
     }
 
-    private func paragraphStyle(firstLineHeadIndent: CGFloat = 0, headIndent: CGFloat = 0) -> NSParagraphStyle {
+    private func lineRecords(in text: NSString, fullRange: NSRange) -> [(line: String, range: NSRange)] {
+        var records: [(line: String, range: NSRange)] = []
+        text.enumerateSubstrings(in: fullRange, options: [.byLines, .substringNotRequired]) { _, range, _, _ in
+            records.append((text.substring(with: range), range))
+        }
+        return records
+    }
+
+    private func tableLineRoles(in lines: [(line: String, range: NSRange)]) -> [Int: TableLineRole] {
+        var roles: [Int: TableLineRole] = [:]
+        var index = 0
+
+        while index + 1 < lines.count {
+            guard isPotentialTableRow(lines[index].line),
+                  isTableSeparator(lines[index + 1].line),
+                  markdownTableCells(lines[index].line).count == markdownTableCells(lines[index + 1].line).count else {
+                index += 1
+                continue
+            }
+
+            roles[index] = .header
+            roles[index + 1] = .separator
+            index += 2
+
+            while index < lines.count, isPotentialTableRow(lines[index].line) {
+                roles[index] = .body
+                index += 1
+            }
+        }
+
+        return roles
+    }
+
+    private func isPotentialTableRow(_ line: String) -> Bool {
+        isRenderedTableRow(line)
+    }
+
+    private func isTableSeparator(_ line: String) -> Bool {
+        isRenderedTableSeparator(line)
+    }
+
+    private func markdownTableCells(_ line: String) -> [String] {
+        renderedTableCells(line)
+    }
+
+    private func mergedRanges(for ranges: [NSRange]) -> [NSRange] {
+        let sorted = ranges.sorted { $0.location < $1.location }
+        var merged: [NSRange] = []
+
+        for range in sorted {
+            guard let last = merged.last else {
+                merged.append(range)
+                continue
+            }
+
+            if range.location <= last.upperBound {
+                merged[merged.count - 1] = NSRange(location: last.location, length: max(last.upperBound, range.upperBound) - last.location)
+            } else {
+                merged.append(range)
+            }
+        }
+
+        return merged
+    }
+
+    private func pipeRanges(in line: String, lineRange: NSRange) -> [NSRange] {
+        pipeOffsets(in: line).map { NSRange(location: lineRange.location + $0, length: 1) }
+    }
+
+    private func applyRegex(_ pattern: String, storage: NSTextStorage, range: NSRange, action: (NSTextCheckingResult) -> Void) {
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return }
+        regex.enumerateMatches(in: storage.string, range: range) { match, _, _ in
+            guard let match else { return }
+            action(match)
+        }
+    }
+
+    private func hideSyntax(in range: NSRange, storage: NSTextStorage) {
+        guard range.location >= 0, range.length > 0, range.upperBound <= storage.length else { return }
+        storage.addAttributes([
+            .font: NSFont.systemFont(ofSize: 1),
+            .foregroundColor: NSColor.textBackgroundColor,
+            .backgroundColor: NSColor.textBackgroundColor
+        ], range: range)
+    }
+
+    private func intersects(_ range: NSRange, _ other: NSRange?) -> Bool {
+        guard let other else { return false }
+        return NSIntersectionRange(range, other).length > 0
+    }
+
+    private func intersectsAny(_ range: NSRange, _ ranges: [NSRange]) -> Bool {
+        ranges.contains { NSIntersectionRange(range, $0).length > 0 }
+    }
+
+    private func isCodeFence(_ line: String) -> Bool {
+        line.trimmingCharacters(in: .whitespaces).hasPrefix("```")
+    }
+
+    private func listMarkerLength(_ line: String) -> Int {
+        if line.hasPrefix("- [ ] ") || line.hasPrefix("- [x] ") || line.hasPrefix("- [X] ") { return 6 }
+        if line.hasPrefix("- ") || line.hasPrefix("* ") { return 2 }
+        guard let match = line.range(of: #"^\d+\. "#, options: .regularExpression) else { return 0 }
+        return line.distance(from: line.startIndex, to: match.upperBound)
+    }
+
+    private func paragraphStyle(firstLineHeadIndent: CGFloat = 0, headIndent: CGFloat = 0, paragraphSpacing: CGFloat = 9) -> NSParagraphStyle {
         let style = NSMutableParagraphStyle()
         style.lineSpacing = 5
-        style.paragraphSpacing = 9
+        style.paragraphSpacing = paragraphSpacing
         style.firstLineHeadIndent = firstLineHeadIndent
         style.headIndent = headIndent
         return style
@@ -558,12 +1162,19 @@ final class MarkdownHighlighter {
 
 @main
 struct MarkLensApp: App {
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+
     var body: some Scene {
-        WindowGroup {
+        Window("MarkLens", id: "main") {
             MarkLensAppView()
         }
         .commands {
             CommandGroup(replacing: .newItem) {
+                Button("Open File") {
+                    NotificationCenter.default.post(name: .markLensOpenFileCommand, object: nil)
+                }
+                .keyboardShortcut("o", modifiers: [.command])
+
                 Button("New Note") {
                     NotificationCenter.default.post(name: .markLensNewNoteCommand, object: nil)
                 }

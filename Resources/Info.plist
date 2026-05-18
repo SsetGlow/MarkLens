@@ -6,12 +6,35 @@
   <string>en</string>
   <key>CFBundleExecutable</key>
   <string>MarkLens</string>
-  <key>CFBundleIconFile</key>
-  <string>AppIcon</string>
-  <key>CFBundleIdentifier</key>
-  <string>com.ssetglow.marklens</string>
-  <key>CFBundleInfoDictionaryVersion</key>
-  <string>6.0</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.ssetglow.marklens</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeExtensions</key>
+			<array>
+				<string>md</string>
+				<string>markdown</string>
+			</array>
+			<key>CFBundleTypeIconFile</key>
+			<string>AppIcon</string>
+			<key>CFBundleTypeName</key>
+			<string>Markdown Document</string>
+			<key>CFBundleTypeRole</key>
+			<string>Editor</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.markdown</string>
+				<string>net.daringfireball.markdown</string>
+			</array>
+		</dict>
+	</array>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
   <key>CFBundleName</key>
   <string>MarkLens</string>
   <key>CFBundleDisplayName</key>
@@ -19,15 +42,19 @@
   <key>CFBundlePackageType</key>
   <string>APPL</string>
   <key>CFBundleShortVersionString</key>
-  <string>0.1.0</string>
+  <string>0.1.1</string>
   <key>CFBundleVersion</key>
-  <string>1</string>
+  <string>2</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
   <key>NSHighResolutionCapable</key>
-  <true/>
-  <key>NSSupportsAutomaticTermination</key>
-  <true/>
+	<true/>
+	<key>NSSupportsOpeningDocumentsInPlace</key>
+	<true/>
+	<key>NSSupportsAutomaticTermination</key>
+	<true/>
+	<key>NSQuitAlwaysKeepsWindows</key>
+	<false/>
   <key>NSSupportsSuddenTermination</key>
   <true/>
 </dict>

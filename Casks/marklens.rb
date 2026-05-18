@@ -1,6 +1,6 @@
 cask "marklens" do
-  version "0.1.0"
-  sha256 "18432461829ced27b4862d7450fa5037502a79bbcc8e00a33cce2ff32796adc6"
+  version "0.1.1"
+  sha256 "f7aea4cf4227a8a008c2552cab9af6ef1ad618536fa2f7f60797cd20f9ee4e6f"
 
   url "https://github.com/SsetGlow/MarkLens/releases/download/v#{version}/MarkLens-#{version}-arm64.dmg"
   name "MarkLens"

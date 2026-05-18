@@ -18,7 +18,7 @@ MarkLens is a native macOS Markdown editor focused on same-canvas writing: the c
 The app bundle is created at:
 
 ```text
-build/MarkLens.app
+.build/MarkLens.app
 ```
 
 ## Package
@@ -30,13 +30,13 @@ build/MarkLens.app
 The installer image is created at:
 
 ```text
-dist/MarkLens-0.1.0-arm64.dmg
+dist/MarkLens-0.1.1-arm64.dmg
 ```
 
 ## Install Locally
 
 ```bash
-cp -R build/MarkLens.app /Applications/
+cp -R .build/MarkLens.app /Applications/
 open /Applications/MarkLens.app
 ```
 
@@ -48,4 +48,4 @@ After publishing the DMG as a GitHub release asset, the included cask can be use
 brew install --cask ./Casks/marklens.rb
 ```
 
-For a real public tap, replace `sha256 :no_check` with the release DMG checksum.
+The included cask tracks the release DMG URL and checksum.

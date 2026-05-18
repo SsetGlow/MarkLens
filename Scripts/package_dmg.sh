@@ -3,9 +3,9 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 APP_NAME="MarkLens"
-VERSION="0.1.0"
-APP_BUNDLE="$ROOT/build/$APP_NAME.app"
-STAGE="$ROOT/build/dmg-stage"
+VERSION="0.1.1"
+APP_BUNDLE="$ROOT/.build/$APP_NAME.app"
+STAGE="$ROOT/.build/dmg-stage"
 DMG="$ROOT/dist/$APP_NAME-$VERSION-arm64.dmg"
 
 "$ROOT/Scripts/build.sh" >/dev/null

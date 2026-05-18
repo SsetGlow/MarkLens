@@ -54,7 +54,7 @@ def png(path, size):
 
 
 def main():
-    out = os.path.abspath("build/AppIcon.iconset")
+    out = os.path.abspath(".build/AppIcon.iconset")
     os.makedirs(out, exist_ok=True)
     specs = [
         ("icon_16x16.png", 16),
