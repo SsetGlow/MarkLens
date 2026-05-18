@@ -745,47 +745,143 @@ private struct RenderedTableBlock {
 }
 
 private func isRenderedTableRow(_ line: String) -> Bool {
-    let trimmed = line.trimmingCharacters(in: .whitespaces)
-    guard trimmed.contains("|") else { return false }
-    return renderedTableCells(trimmed).count >= 2
+    guard tableIndentWidth(line) <= 3 else { return false }
+    return renderedTableCells(line).count >= 2
 }
 
 private func isRenderedTableSeparator(_ line: String) -> Bool {
     let cells = renderedTableCells(line)
     guard cells.count >= 2 else { return false }
     return cells.allSatisfy { cell in
-        cell.range(of: #"^:?-{3,}:?$"#, options: .regularExpression) != nil
+        cell.range(of: #"^:?-+:?$"#, options: .regularExpression) != nil
     }
 }
 
 private func renderedTableCells(_ line: String) -> [String] {
-    var trimmed = line.trimmingCharacters(in: .whitespaces)
-    if trimmed.hasPrefix("|") {
-        trimmed.removeFirst()
-    }
-    if trimmed.hasSuffix("|") {
-        trimmed.removeLast()
+    var cells: [String] = []
+    var cell = ""
+    var escaped = false
+    var inCodeSpan = false
+    var codeTickLength = 0
+    let trimmed = line.trimmingCharacters(in: .whitespaces)
+    var index = trimmed.startIndex
+
+    while index < trimmed.endIndex {
+        let character = trimmed[index]
+        if escaped {
+            cell.append(character)
+            escaped = false
+            index = trimmed.index(after: index)
+            continue
+        }
+
+        if character == "\\" {
+            cell.append(character)
+            escaped = true
+            index = trimmed.index(after: index)
+            continue
+        }
+
+        if character == "`" {
+            let runStart = index
+            while index < trimmed.endIndex, trimmed[index] == "`" {
+                index = trimmed.index(after: index)
+            }
+            let tickLength = trimmed.distance(from: runStart, to: index)
+            if inCodeSpan, tickLength == codeTickLength {
+                inCodeSpan = false
+                codeTickLength = 0
+            } else if !inCodeSpan {
+                inCodeSpan = true
+                codeTickLength = tickLength
+            }
+            cell.append(contentsOf: trimmed[runStart..<index])
+            continue
+        }
+
+        if character == "|", !inCodeSpan {
+            cells.append(cell.trimmingCharacters(in: .whitespaces))
+            cell = ""
+            index = trimmed.index(after: index)
+            continue
+        }
+
+        cell.append(character)
+        index = trimmed.index(after: index)
     }
 
-    return trimmed
-        .split(separator: "|", omittingEmptySubsequences: false)
-        .map { $0.trimmingCharacters(in: .whitespaces) }
+    cells.append(cell.trimmingCharacters(in: .whitespaces))
+
+    if cells.first == "" {
+        cells.removeFirst()
+    }
+    if cells.last == "" {
+        cells.removeLast()
+    }
+
+    return cells
 }
 
 private func pipeOffsets(in line: String) -> [Int] {
-    let nsLine = line as NSString
     var offsets: [Int] = []
-    var searchRange = NSRange(location: 0, length: nsLine.length)
+    var escaped = false
+    var inCodeSpan = false
+    var codeTickLength = 0
+    var index = line.startIndex
 
-    while searchRange.length > 0 {
-        let found = nsLine.range(of: "|", options: [], range: searchRange)
-        guard found.location != NSNotFound else { break }
-        offsets.append(found.location)
-        let nextLocation = found.upperBound
-        searchRange = NSRange(location: nextLocation, length: nsLine.length - nextLocation)
+    while index < line.endIndex {
+        let character = line[index]
+
+        if escaped {
+            escaped = false
+            index = line.index(after: index)
+            continue
+        }
+
+        if character == "\\" {
+            escaped = true
+            index = line.index(after: index)
+            continue
+        }
+
+        if character == "`" {
+            let runStart = index
+            while index < line.endIndex, line[index] == "`" {
+                index = line.index(after: index)
+            }
+            let tickLength = line.distance(from: runStart, to: index)
+            if inCodeSpan, tickLength == codeTickLength {
+                inCodeSpan = false
+                codeTickLength = 0
+            } else if !inCodeSpan {
+                inCodeSpan = true
+                codeTickLength = tickLength
+            }
+            continue
+        }
+
+        if character == "|", !inCodeSpan {
+            offsets.append(line.utf16.distance(from: line.utf16.startIndex, to: index.samePosition(in: line.utf16)!))
+        }
+
+        index = line.index(after: index)
     }
 
     return offsets
+}
+
+private func tableIndentWidth(_ line: String) -> Int {
+    var width = 0
+    for character in line {
+        if character == " " {
+            width += 1
+        } else if character == "\t" {
+            width += 4 - width % 4
+        } else {
+            break
+        }
+    }
+    return width
 }
 
 final class MarkdownHighlighter {
