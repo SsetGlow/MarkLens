@@ -416,7 +416,7 @@ struct MarkLensAppView: View {
 }
 
 enum EditorCommand {
-    case heading1, heading2, bold, italic, code, quote, list, task
+    case heading1, heading2, bold, italic, code, quote, list, task, indent, outdent
 }
 
 extension Notification.Name {
@@ -483,6 +483,7 @@ struct MarkdownTextView: NSViewRepresentable {
         private var highlightTask: Task<Void, Never>?
         private var lastActiveLine = NSRange(location: NSNotFound, length: 0)
         private var lastScrollTarget: String?
+        private var pendingEditedRange: NSRange?
         private let highlighter = MarkdownHighlighter()
 
         init(_ parent: MarkdownTextView) {
@@ -507,7 +508,8 @@ struct MarkdownTextView: NSViewRepresentable {
             guard let textView else { return }
             guard !isApplyingHighlight else { return }
             parent.onChange(textView.string)
-            scheduleHighlighting()
+            scheduleHighlighting(in: pendingEditedRange)
+            pendingEditedRange = nil
         }
 
         func textViewDidChangeSelection(_ notification: Notification) {
@@ -515,10 +517,23 @@ struct MarkdownTextView: NSViewRepresentable {
             guard let textView else { return }
             let activeLine = currentLineRange(in: textView)
             guard !NSEqualRanges(activeLine, lastActiveLine) else { return }
-            applyHighlighting(preservingViewport: true)
+            let previousLine = lastActiveLine
+            let changedRange = NSUnionRange(activeLine, previousLine.location == NSNotFound ? activeLine : previousLine)
+            applyHighlighting(in: changedRange, preservingViewport: true)
+        }
+
+        func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            let replacementLength = (replacementString ?? "").utf16.count
+            let newLength = max(replacementLength, affectedCharRange.length)
+            pendingEditedRange = NSRange(location: affectedCharRange.location, length: newLength)
+            return true
         }
 
         func applyHighlighting(preservingViewport: Bool = false) {
+            applyHighlighting(in: nil, preservingViewport: preservingViewport)
+        }
+
+        private func applyHighlighting(in changedRange: NSRange?, preservingViewport: Bool = false) {
             guard let textView, let storage = textView.textStorage else { return }
             guard !isApplyingHighlight else { return }
             let updates = {
@@ -526,7 +541,7 @@ struct MarkdownTextView: NSViewRepresentable {
                 let selection = textView.selectedRanges
                 let activeLine = self.currentLineRange(in: textView)
                 self.lastActiveLine = activeLine
-                self.highlighter.apply(to: storage, activeLine: activeLine)
+                self.highlighter.apply(to: storage, activeLine: activeLine, changedRange: changedRange)
                 textView.selectedRanges = selection
                 textView.typingAttributes = [
                     .font: NSFont.systemFont(ofSize: 17),
@@ -545,7 +560,7 @@ struct MarkdownTextView: NSViewRepresentable {
             let selection = textView.selectedRanges
             let activeLine = currentLineRange(in: textView)
             lastActiveLine = activeLine
-            highlighter.apply(to: storage, activeLine: activeLine)
+            highlighter.apply(to: storage, activeLine: activeLine, changedRange: changedRange)
             textView.selectedRanges = selection
             textView.typingAttributes = [
                 .font: NSFont.systemFont(ofSize: 17),
@@ -555,12 +570,12 @@ struct MarkdownTextView: NSViewRepresentable {
             isApplyingHighlight = false
         }
 
-        private func scheduleHighlighting() {
+        private func scheduleHighlighting(in changedRange: NSRange?) {
             highlightTask?.cancel()
             highlightTask = Task { @MainActor [weak self] in
                 try? await Task.sleep(for: .milliseconds(35))
                 guard !Task.isCancelled else { return }
-                self?.applyHighlighting()
+                self?.applyHighlighting(in: changedRange)
             }
         }
 
@@ -610,6 +625,10 @@ struct MarkdownTextView: NSViewRepresentable {
                 prefixCurrentLine("- ", in: textView)
             case .task:
                 prefixCurrentLine("- [ ] ", in: textView)
+            case .indent:
+                shiftSelectedLines(in: textView, direction: .indent)
+            case .outdent:
+                shiftSelectedLines(in: textView, direction: .outdent)
             case .bold:
                 wrapSelection("**", in: textView)
             case .italic:
@@ -618,7 +637,12 @@ struct MarkdownTextView: NSViewRepresentable {
                 wrapSelection("`", in: textView)
             }
             parent.onChange(textView.string)
-            applyHighlighting()
+            applyHighlighting(in: textView.selectedRange())
+        }
+
+        private enum IndentDirection {
+            case indent
+            case outdent
         }
 
         private func lineRange(for selectedRange: NSRange, in text: NSString) -> NSRange {
@@ -644,10 +668,105 @@ struct MarkdownTextView: NSViewRepresentable {
             let value = nsText.substring(with: selected)
             textView.insertText(marker + value + marker, replacementRange: selected)
         }
+
+        private func shiftSelectedLines(in textView: NSTextView, direction: IndentDirection) {
+            let nsText = textView.string as NSString
+            let selected = textView.selectedRange()
+            let lineRange = nsText.lineRange(for: selected)
+            let original = nsText.substring(with: lineRange)
+            let lines = original.components(separatedBy: "\n")
+            let keepsTrailingNewline = original.hasSuffix("\n")
+            let editableLines = keepsTrailingNewline ? Array(lines.dropLast()) : lines
+            let shifted = editableLines.map { line in
+                switch direction {
+                case .indent:
+                    return "    " + line
+                case .outdent:
+                    if line.hasPrefix("    ") {
+                        return String(line.dropFirst(4))
+                    }
+                    if line.hasPrefix("\t") || line.hasPrefix(" ") {
+                        return String(line.dropFirst())
+                    }
+                    return line
+                }
+            }
+            var replacement = shifted.joined(separator: "\n")
+            if keepsTrailingNewline {
+                replacement += "\n"
+            }
+            textView.insertText(replacement, replacementRange: lineRange)
+            textView.setSelectedRange(NSRange(location: lineRange.location, length: replacement.utf16.count))
+        }
     }
 }
 
 final class StableMarkdownTextView: NSTextView {
+    override func keyDown(with event: NSEvent) {
+        if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command) {
+            switch event.charactersIgnoringModifiers {
+            case "]":
+                NotificationCenter.default.post(name: .markLensFormatCommand, object: EditorCommand.indent)
+                return
+            case "[":
+                NotificationCenter.default.post(name: .markLensFormatCommand, object: EditorCommand.outdent)
+                return
+            default:
+                break
+            }
+        }
+
+        super.keyDown(with: event)
+    }
+
+    override func insertNewline(_ sender: Any?) {
+        if insertMarkdownContinuation() {
+            return
+        }
+        super.insertNewline(sender)
+    }
+
+    private func insertMarkdownContinuation() -> Bool {
+        let selected = selectedRange()
+        guard selected.length == 0 else { return false }
+        let nsText = string as NSString
+        guard nsText.length > 0 else { return false }
+        let lineRange = nsText.lineRange(for: NSRange(location: min(selected.location, nsText.length), length: 0))
+        let rawLine = nsText.substring(with: lineRange).trimmingCharacters(in: .newlines)
+        guard let continuation = markdownContinuation(after: rawLine) else { return false }
+        insertText("\n" + continuation, replacementRange: selected)
+        return true
+    }
+
+    private func markdownContinuation(after line: String) -> String? {
+        guard let match = line.range(of: #"^(\s*)((?:[-*+])|\d+[.])\s+((?:\[[ xX]\]\s+)?)"#, options: .regularExpression) else {
+            return nil
+        }
+        let matched = String(line[match])
+        let nsMatched = matched as NSString
+        let regex = try? NSRegularExpression(pattern: #"^(\s*)((?:[-*+])|\d+[.])\s+((?:\[[ xX]\]\s+)?)"#)
+        guard let result = regex?.firstMatch(in: matched, range: NSRange(location: 0, length: nsMatched.length)) else { return nil }
+        let indent = nsMatched.substring(with: result.range(at: 1))
+        let marker = nsMatched.substring(with: result.range(at: 2))
+        let checkbox = result.range(at: 3).length > 0 ? "[ ] " : ""
+        let contentStart = line.index(line.startIndex, offsetBy: matched.count)
+        let content = line[contentStart...].trimmingCharacters(in: .whitespaces)
+
+        if content.isEmpty {
+            let clearRange = NSRange(location: selectedRange().location - (line as NSString).length, length: (line as NSString).length)
+            if clearRange.location >= 0 {
+                insertText("", replacementRange: clearRange)
+            }
+            return nil
+        }
+
+        if marker.range(of: #"^\d+[.]$"#, options: .regularExpression) != nil {
+            let number = Int(marker.dropLast()) ?? 1
+            return "\(indent)\(number + 1). "
+        }
+
+        return "\(indent)\(marker) \(checkbox)"
+    }
     private var protectedVisibleOrigin: NSPoint?
     private var protectionDepth = 0
 
@@ -921,23 +1040,32 @@ final class MarkdownHighlighter {
         return result.trimmingCharacters(in: CharacterSet(charactersIn: "-"))
     }
 
-    func apply(to storage: NSTextStorage, activeLine: NSRange?) {
+    func apply(to storage: NSTextStorage, activeLine: NSRange?, changedRange: NSRange? = nil) {
         let full = NSRange(location: 0, length: storage.length)
+        let text = storage.string as NSString
+        let renderRange = changedRange.map { expandedRenderRange(for: $0, in: text, fullRange: full) } ?? full
+
+        guard renderRange.location != NSNotFound, renderRange.length >= 0, renderRange.upperBound <= storage.length else { return }
+
         storage.beginEditing()
         storage.setAttributes([
             .font: baseFont,
             .foregroundColor: NSColor.labelColor,
             .backgroundColor: NSColor.textBackgroundColor,
             .paragraphStyle: paragraphStyle()
-        ], range: full)
+        ], range: renderRange)
 
-        let text = storage.string as NSString
-        let lines = lineRecords(in: text, fullRange: full)
+        let lines = lineRecords(in: text, fullRange: renderRange)
         let tableRoles = tableLineRoles(in: lines)
         let tableRanges = mergedRanges(for: tableRoles.keys.map { lines[$0].range })
-        var inCodeBlock = false
+        var inCodeBlock = isInCodeBlock(at: renderRange.location, text: text)
         var codeBlockRanges: [NSRange] = []
         var codeBlockStart: Int?
+
+        if inCodeBlock {
+            codeBlockStart = renderRange.location
+        }
+
         for (index, record) in lines.enumerated() {
             guard record.range.length > 0 else { continue }
             self.styleLine(
@@ -950,7 +1078,7 @@ final class MarkdownHighlighter {
             )
             if self.isCodeFence(record.line) {
                 if let start = codeBlockStart {
-                    codeBlockRanges.append(NSRange(location: start, length: record.range.upperBound - start))
+                    codeBlockRanges.append(clampedRange(NSRange(location: start, length: record.range.upperBound - start), to: renderRange))
                     codeBlockStart = nil
                 } else {
                     codeBlockStart = record.range.location
@@ -959,10 +1087,10 @@ final class MarkdownHighlighter {
             }
         }
         if let start = codeBlockStart {
-            codeBlockRanges.append(NSRange(location: start, length: storage.length - start))
+            codeBlockRanges.append(clampedRange(NSRange(location: start, length: renderRange.upperBound - start), to: renderRange))
         }
 
-        styleInlineMarkdown(storage, activeLine: activeLine, excludedRanges: codeBlockRanges + tableRanges)
+        styleInlineMarkdown(storage, activeLine: activeLine, excludedRanges: codeBlockRanges + tableRanges, searchRange: renderRange)
         storage.endEditing()
     }
 
@@ -1076,10 +1204,8 @@ final class MarkdownHighlighter {
         }
     }
 
-    private func styleInlineMarkdown(_ storage: NSTextStorage, activeLine: NSRange?, excludedRanges: [NSRange]) {
-        let full = NSRange(location: 0, length: storage.length)
-
-        applyRegex(#"`([^`]+)`"#, storage: storage, range: full) { match in
+    private func styleInlineMarkdown(_ storage: NSTextStorage, activeLine: NSRange?, excludedRanges: [NSRange], searchRange: NSRange) {
+        applyRegex(#"`([^`]+)`"#, storage: storage, range: searchRange) { match in
             guard !self.intersectsAny(match.range, excludedRanges) else { return }
             let isActive = self.intersects(match.range, activeLine)
             if isActive {
@@ -1095,7 +1221,7 @@ final class MarkdownHighlighter {
             ], range: match.range(at: 1))
         }
 
-        applyRegex(#"\*\*([^*]+)\*\*"#, storage: storage, range: full) { match in
+        applyRegex(#"\*\*([^*]+)\*\*"#, storage: storage, range: searchRange) { match in
             guard !self.intersectsAny(match.range, excludedRanges) else { return }
             let isActive = self.intersects(match.range, activeLine)
             if isActive {
@@ -1107,7 +1233,7 @@ final class MarkdownHighlighter {
             storage.addAttributes([.font: NSFont.boldSystemFont(ofSize: 17), .foregroundColor: NSColor.labelColor], range: match.range(at: 1))
         }
 
-        applyRegex(#"(?<!\*)\*([^*]+)\*(?!\*)"#, storage: storage, range: full) { match in
+        applyRegex(#"(?<!\*)\*([^*]+)\*(?!\*)"#, storage: storage, range: searchRange) { match in
             guard !self.intersectsAny(match.range, excludedRanges) else { return }
             let italic = NSFontManager.shared.convert(self.baseFont, toHaveTrait: .italicFontMask)
             let isActive = self.intersects(match.range, activeLine)
@@ -1120,7 +1246,7 @@ final class MarkdownHighlighter {
             storage.addAttributes([.font: italic, .foregroundColor: NSColor.labelColor], range: match.range(at: 1))
         }
 
-        applyRegex(#"\[([^\]]+)\]\(([^)]+)\)"#, storage: storage, range: full) { match in
+        applyRegex(#"\[([^\]]+)\]\(([^)]+)\)"#, storage: storage, range: searchRange) { match in
             guard !self.intersectsAny(match.range, excludedRanges) else { return }
             let isActive = self.intersects(match.range, activeLine)
             if isActive {
@@ -1138,6 +1264,63 @@ final class MarkdownHighlighter {
                 .underlineStyle: NSUnderlineStyle.single.rawValue
             ], range: match.range(at: 1))
         }
+    }
+
+    private func expandedRenderRange(for changedRange: NSRange, in text: NSString, fullRange: NSRange) -> NSRange {
+        guard fullRange.length > 0 else { return fullRange }
+        let location = min(max(changedRange.location, 0), fullRange.length)
+        let length = min(max(changedRange.length, 0), max(fullRange.length - location, 0))
+        var range = text.lineRange(for: NSRange(location: location, length: length))
+
+        if range.location > 0 {
+            let previousLocation = max(range.location - 1, 0)
+            range = NSUnionRange(range, text.lineRange(for: NSRange(location: previousLocation, length: 0)))
+        }
+
+        if range.upperBound < fullRange.upperBound {
+            range = NSUnionRange(range, text.lineRange(for: NSRange(location: range.upperBound, length: 0)))
+        }
+
+        while range.location > 0 {
+            let previousLine = text.lineRange(for: NSRange(location: max(range.location - 1, 0), length: 0))
+            let previousText = text.substring(with: previousLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !previousText.isEmpty, shouldExtendBlock(previousText) else { break }
+            range = NSUnionRange(range, previousLine)
+        }
+
+        while range.upperBound < fullRange.upperBound {
+            let nextLine = text.lineRange(for: NSRange(location: range.upperBound, length: 0))
+            let nextText = text.substring(with: nextLine).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !nextText.isEmpty, shouldExtendBlock(nextText) else { break }
+            range = NSUnionRange(range, nextLine)
+        }
+
+        return clampedRange(range, to: fullRange)
+    }
+
+    private func shouldExtendBlock(_ line: String) -> Bool {
+        isRenderedTableRow(line)
+            || isRenderedTableSeparator(line)
+            || line.range(of: #"^(\s*)(([-*+]|\d+[.])\s+)"#, options: .regularExpression) != nil
+            || isCodeFence(line)
+    }
+
+    private func isInCodeBlock(at location: Int, text: NSString) -> Bool {
+        guard location > 0 else { return false }
+        var inCodeBlock = false
+        let prefixRange = NSRange(location: 0, length: min(location, text.length))
+        text.enumerateSubstrings(in: prefixRange, options: [.byLines, .substringNotRequired]) { _, range, _, _ in
+            if self.isCodeFence(text.substring(with: range)) {
+                inCodeBlock.toggle()
+            }
+        }
+        return inCodeBlock
+    }
+
+    private func clampedRange(_ range: NSRange, to bounds: NSRange) -> NSRange {
+        let lower = max(range.location, bounds.location)
+        let upper = min(range.upperBound, bounds.upperBound)
+        return NSRange(location: lower, length: max(upper - lower, 0))
     }
 
     private func lineRecords(in text: NSString, fullRange: NSRange) -> [(line: String, range: NSRange)] {
@@ -1275,6 +1458,18 @@ struct MarkLensApp: App {
                     NotificationCenter.default.post(name: .markLensNewNoteCommand, object: nil)
                 }
                 .keyboardShortcut("n", modifiers: [.command])
+            }
+
+            CommandGroup(after: .textEditing) {
+                Button("Indent") {
+                    NotificationCenter.default.post(name: .markLensFormatCommand, object: EditorCommand.indent)
+                }
+                .keyboardShortcut("]", modifiers: [.command])
+
+                Button("Outdent") {
+                    NotificationCenter.default.post(name: .markLensFormatCommand, object: EditorCommand.outdent)
+                }
+                .keyboardShortcut("[", modifiers: [.command])
             }
         }
     }
