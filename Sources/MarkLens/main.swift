@@ -523,9 +523,12 @@ struct MarkdownTextView: NSViewRepresentable {
         }
 
         func textView(_ textView: NSTextView, shouldChangeTextIn affectedCharRange: NSRange, replacementString: String?) -> Bool {
+            let nsText = textView.string as NSString
             let replacementLength = (replacementString ?? "").utf16.count
             let newLength = max(replacementLength, affectedCharRange.length)
-            pendingEditedRange = NSRange(location: affectedCharRange.location, length: newLength)
+            let editedRange = NSRange(location: affectedCharRange.location, length: newLength)
+            let originalLineRange = nsText.lineRange(for: NSRange(location: min(affectedCharRange.location, nsText.length), length: 0))
+            pendingEditedRange = NSUnionRange(editedRange, originalLineRange)
             return true
         }
 
@@ -703,7 +706,13 @@ struct MarkdownTextView: NSViewRepresentable {
 
 final class StableMarkdownTextView: NSTextView {
     override func keyDown(with event: NSEvent) {
-        if event.modifierFlags.intersection(.deviceIndependentFlagsMask).contains(.command) {
+        let modifiers = event.modifierFlags.intersection(.deviceIndependentFlagsMask)
+        if event.keyCode == 48, modifiers.isSubset(of: [.shift]) {
+            NotificationCenter.default.post(name: .markLensFormatCommand, object: EditorCommand.indent)
+            return
+        }
+
+        if modifiers.contains(.command) {
             switch event.charactersIgnoringModifiers {
             case "]":
                 NotificationCenter.default.post(name: .markLensFormatCommand, object: EditorCommand.indent)
@@ -753,7 +762,9 @@ final class StableMarkdownTextView: NSTextView {
         let content = line[contentStart...].trimmingCharacters(in: .whitespaces)
 
         if content.isEmpty {
-            let clearRange = NSRange(location: selectedRange().location - (line as NSString).length, length: (line as NSString).length)
+            let lineLength = (line as NSString).length
+            let currentLocation = selectedRange().location
+            let clearRange = NSRange(location: max(currentLocation - lineLength, 0), length: min(lineLength, currentLocation))
             if clearRange.location >= 0 {
                 insertText("", replacementRange: clearRange)
             }
@@ -1281,6 +1292,8 @@ final class MarkdownHighlighter {
             range = NSUnionRange(range, text.lineRange(for: NSRange(location: range.upperBound, length: 0)))
         }
 
+        range = includeNeighborLines(around: range, in: text, fullRange: fullRange, count: 2)
+
         while range.location > 0 {
             let previousLine = text.lineRange(for: NSRange(location: max(range.location - 1, 0), length: 0))
             let previousText = text.substring(with: previousLine).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1296,6 +1309,24 @@ final class MarkdownHighlighter {
         }
 
         return clampedRange(range, to: fullRange)
+    }
+
+    private func includeNeighborLines(around range: NSRange, in text: NSString, fullRange: NSRange, count: Int) -> NSRange {
+        var expanded = range
+
+        for _ in 0..<count {
+            guard expanded.location > fullRange.location else { break }
+            let previousLine = text.lineRange(for: NSRange(location: max(expanded.location - 1, fullRange.location), length: 0))
+            expanded = NSUnionRange(expanded, previousLine)
+        }
+
+        for _ in 0..<count {
+            guard expanded.upperBound < fullRange.upperBound else { break }
+            let nextLine = text.lineRange(for: NSRange(location: expanded.upperBound, length: 0))
+            expanded = NSUnionRange(expanded, nextLine)
+        }
+
+        return clampedRange(expanded, to: fullRange)
     }
 
     private func shouldExtendBlock(_ line: String) -> Bool {
